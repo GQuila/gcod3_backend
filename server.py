@@ -86,7 +86,14 @@ SMTP_PASSWORD = os.environ.get('SMTP_PASSWORD', '')
 CONTACT_TO = os.environ.get('CONTACT_TO', 'gcod3web@gmail.com')
 CONTACT_FROM = os.environ.get('CONTACT_FROM', SMTP_USER or 'noreply@gcod3.com')
 
-client = AsyncIOMotorClient(MONGO_URL)
+client = AsyncIOMotorClient(
+    MONGO_URL,
+    # Fail fast (5s) if Atlas is unreachable instead of hanging 30s.
+    # When this trips the most common cause is Atlas Network Access not
+    # allowing Render's IPs - add 0.0.0.0/0 in Atlas -> Network Access.
+    serverSelectionTimeoutMS=5000,
+    connectTimeoutMS=10000,
+)
 db = client[DB_NAME]
 
 app = FastAPI(title="GCOD3 API", version="1.0.0")
@@ -304,24 +311,36 @@ def serialize_user(u: dict) -> dict:
 # ─── Auth Routes ────────────────────────────────────────────────────────────
 @api.post("/auth/signup")
 async def signup(payload: UserCreate, response: Response):
-    existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
-    if existing:
-        raise HTTPException(status_code=400, detail="Email already registered")
-    user_id = f"user_{uuid.uuid4().hex[:12]}"
-    doc = {
-        "user_id": user_id,
-        "email": payload.email.lower(),
-        "name": payload.name,
-        "password_hash": hash_password(payload.password),
-        "role": "user",
-        "plan": "free",
-        "auth_provider": "password",
-        "created_at": now_iso(),
-    }
-    await db.users.insert_one(doc)
-    token = create_jwt(user_id)
-    response.set_cookie("session_token", token, httponly=True, secure=True, samesite="none", path="/", max_age=60*60*24*7)
-    return {"token": token, "user": serialize_user(doc)}
+    try:
+        existing = await db.users.find_one({"email": payload.email.lower()}, {"_id": 0})
+        if existing:
+            raise HTTPException(status_code=400, detail="Email already registered")
+        user_id = f"user_{uuid.uuid4().hex[:12]}"
+        doc = {
+            "user_id": user_id,
+            "email": payload.email.lower(),
+            "name": payload.name,
+            "password_hash": hash_password(payload.password),
+            "role": "user",
+            "plan": "free",
+            "auth_provider": "password",
+            "created_at": now_iso(),
+        }
+        await db.users.insert_one(doc)
+        token = create_jwt(user_id)
+        response.set_cookie("session_token", token, httponly=True, secure=True, samesite="none", path="/", max_age=60*60*24*7)
+        return {"token": token, "user": serialize_user(doc)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        msg = str(e)
+        logger.exception("Signup failed")
+        if "ServerSelectionTimeoutError" in msg or "timed out" in msg.lower():
+            raise HTTPException(
+                status_code=503,
+                detail="Database unreachable. Check /api/diag for details (Atlas IP allow-list is the usual cause).",
+            )
+        raise HTTPException(status_code=500, detail=f"Signup failed: {msg[:160]}")
 
 @api.post("/auth/login")
 async def login(payload: UserLogin, response: Response):
@@ -836,6 +855,52 @@ async def admin_users(_admin: dict = Depends(admin_only)):
 @api.get("/")
 async def root():
     return {"service": "GCOD3 API", "status": "ok", "time": now_iso()}
+
+
+@api.get("/diag")
+async def diag():
+    """Public diagnostic endpoint - tells you EXACTLY what's broken.
+    Hit https://gcod3-backend.onrender.com/api/diag from your browser
+    after deploying. Each check returns 'ok' or a human-readable error.
+    """
+    checks = {"time": now_iso()}
+
+    # 1) Mongo ping
+    try:
+        await client.admin.command("ping")
+        checks["mongo"] = "ok"
+        checks["mongo_db"] = DB_NAME
+    except Exception as e:
+        msg = str(e)
+        # Translate the common 'serverSelectionTimeoutError' to a friendly hint.
+        if "ServerSelectionTimeoutError" in msg or "timed out" in msg.lower():
+            checks["mongo"] = (
+                "FAIL: cannot reach MongoDB Atlas within 5s. "
+                "Almost always means Atlas IP allow-list is missing 0.0.0.0/0. "
+                "Fix: Atlas -> Network Access -> Add IP Address -> Allow from Anywhere."
+            )
+        elif "authentication failed" in msg.lower() or "bad auth" in msg.lower():
+            checks["mongo"] = "FAIL: MongoDB username/password wrong. Check MONGO_URL env on Render."
+        else:
+            checks["mongo"] = f"FAIL: {msg[:240]}"
+
+    # 2) AI configured
+    checks["ai"] = "ok" if ai_client else "not_configured (set EMERGENT_LLM_KEY)"
+
+    # 3) SMTP configured
+    missing = [n for n, v in [
+        ("SMTP_HOST", SMTP_HOST), ("SMTP_USER", SMTP_USER), ("SMTP_PASSWORD", SMTP_PASSWORD),
+    ] if not v]
+    checks["smtp"] = "ok" if not missing else f"not_configured (missing: {','.join(missing)})"
+
+    # 4) Google Sign-In configured
+    checks["google_signin"] = "ok" if GOOGLE_CLIENT_ID else "not_configured (set GOOGLE_CLIENT_ID to enable)"
+
+    # 5) CORS mode
+    checks["cors_origins"] = os.environ.get('CORS_ORIGINS', '(unset → permissive *)')
+
+    return checks
+
 
 # Include router
 app.include_router(api)
