@@ -7,7 +7,7 @@ services:
     plan: free                      # upgrade to "starter" ($7/mo) for always-on
     region: oregon                  # change if you want (frankfurt, singapore, ohio)
     branch: main
-    buildCommand: pip install -r requirements.txt
+    buildCommand: pip install -r requirements.txt --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
     startCommand: uvicorn server:app --host 0.0.0.0 --port $PORT
     healthCheckPath: /api/
     autoDeploy: true
@@ -23,6 +23,10 @@ services:
         value: HS256
       - key: EMERGENT_LLM_KEY
         sync: false
+      - key: AI_PROVIDER
+        value: anthropic
+      - key: AI_MODEL
+        value: claude-sonnet-4-6
       - key: CORS_ORIGINS
         value: "https://www.gcod3.com,https://gcod3.com"
       # ── optional: Gmail SMTP for contact-form email delivery ──

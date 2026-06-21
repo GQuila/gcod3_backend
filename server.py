@@ -43,8 +43,10 @@ MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ['DB_NAME']
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
-EMERGENT_LLM_KEY = os.environ['EMERGENT_LLM_KEY']
-AI_MODEL = ("anthropic", "claude-sonnet-4-6")
+EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
+AI_PROVIDER = os.environ.get('AI_PROVIDER', 'anthropic')
+AI_MODEL_NAME = os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
+AI_ENABLED = bool(EMERGENT_LLM_KEY)
 
 # SMTP / Contact email — optional, gracefully degrades if not configured
 SMTP_HOST = os.environ.get('SMTP_HOST', '')
@@ -418,28 +420,49 @@ async def ai_chat_stream(payload: ChatRequest):
         "created_at": now_iso(),
     })
 
-    chat = LlmChat(
-        api_key=EMERGENT_LLM_KEY,
-        session_id=sid,
-        system_message=GCOD3_SYSTEM_PROMPT,
-    ).with_model(*AI_MODEL)
-
     async def event_gen():
+        import json as _json
         # send session_id first
-        yield f"data: {{\"session_id\": \"{sid}\"}}\n\n"
+        yield f"data: {_json.dumps({'session_id': sid})}\n\n"
+        if not AI_ENABLED:
+            yield f"data: {_json.dumps({'error': 'AI is not configured on the server.'})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+
+        # Load prior conversation for this session (multi-turn memory)
+        history_docs = await db.ai_messages.find(
+            {"session_id": sid},
+            {"_id": 0, "role": 1, "content": 1, "created_at": 1},
+        ).sort("created_at", 1).to_list(40)
+        # Build a brief prior-conversation context (we'll send the current message via UserMessage)
+        prior = [m for m in history_docs if m["content"] != payload.message][-20:]
+        context_block = ""
+        if prior:
+            lines = []
+            for m in prior:
+                tag = "User" if m["role"] == "user" else "G-Bot"
+                lines.append(f"{tag}: {m['content']}")
+            context_block = "\n\nPrior conversation:\n" + "\n".join(lines) + "\n"
+
         full_text = ""
         try:
-            async for ev in chat.stream_message(UserMessage(text=payload.message)):
-                if isinstance(ev, TextDelta):
-                    full_text += ev.content
-                    # SSE-friendly chunk
-                    import json as _json
-                    yield f"data: {_json.dumps({'delta': ev.content})}\n\n"
-                elif isinstance(ev, StreamDone):
+            chat = LlmChat(
+                api_key=EMERGENT_LLM_KEY,
+                session_id=sid,
+                system_message=GCOD3_SYSTEM_PROMPT + context_block,
+            ).with_model(AI_PROVIDER, AI_MODEL_NAME)
+            async for event in chat.stream_message(UserMessage(text=payload.message)):
+                if isinstance(event, TextDelta):
+                    if not event.content:
+                        continue
+                    full_text += event.content
+                    yield f"data: {_json.dumps({'delta': event.content})}\n\n"
+                elif isinstance(event, StreamDone):
                     break
         except Exception as e:
             logger.exception("AI stream failed")
-            yield f"data: {{\"error\": \"{str(e)[:120]}\"}}\n\n"
+            yield f"data: {_json.dumps({'error': str(e)[:160]})}\n\n"
+
         # persist assistant message
         if full_text:
             await db.ai_messages.insert_one({
@@ -465,16 +488,22 @@ async def ai_tool(payload: AIToolRequest, user: dict = Depends(current_user)):
         "code": "You are a senior software engineer. Provide clean, production-quality code with brief explanation. Output in Markdown with code blocks.",
         "website_content": "You are an elite website copywriter. Generate full sections: Hero headline + sub, 3 feature bullets, CTA. Use Markdown.",
     }
+    if not AI_ENABLED:
+        raise HTTPException(status_code=503, detail="AI is not configured on the server.")
     system = sys_map.get(payload.tool, sys_map["content_writer"])
-    sid = f"tool_{uuid.uuid4().hex[:8]}"
-    chat = LlmChat(api_key=EMERGENT_LLM_KEY, session_id=sid, system_message=system).with_model(*AI_MODEL)
     full_prompt = f"Tone: {payload.tone}.\n\nTask: {payload.prompt}"
     output = ""
     try:
-        async for ev in chat.stream_message(UserMessage(text=full_prompt)):
-            if isinstance(ev, TextDelta):
-                output += ev.content
-            elif isinstance(ev, StreamDone):
+        chat = LlmChat(
+            api_key=EMERGENT_LLM_KEY,
+            session_id=f"tool_{uuid.uuid4().hex[:12]}",
+            system_message=system,
+        ).with_model(AI_PROVIDER, AI_MODEL_NAME)
+        async for event in chat.stream_message(UserMessage(text=full_prompt)):
+            if isinstance(event, TextDelta):
+                if event.content:
+                    output += event.content
+            elif isinstance(event, StreamDone):
                 break
     except Exception as e:
         logger.exception("AI tool failed")
