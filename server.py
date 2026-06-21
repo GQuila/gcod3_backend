@@ -96,47 +96,71 @@ logger = logging.getLogger("gcod3")
 def send_contact_email(payload: dict) -> bool:
     """Deliver a contact-form / lead notification to gcod3web@gmail.com.
 
-    Returns True on success, False on any failure (we never block the user
-    response on email — the lead is always persisted to Mongo first).
+    Tries STARTTLS first (port 587), falls back to implicit SSL (port 465) if
+    STARTTLS is blocked by the host. Returns True on success, False on any
+    failure (we never block the user response on email — the lead is always
+    persisted to Mongo first).
     """
     if not (SMTP_HOST and SMTP_USER and SMTP_PASSWORD):
-        logger.info("SMTP not configured — skipping email send (lead saved to DB)")
+        logger.warning(
+            "SMTP not configured. Contact email skipped. Missing env vars: %s",
+            [n for n, v in [('SMTP_HOST', SMTP_HOST), ('SMTP_USER', SMTP_USER), ('SMTP_PASSWORD', SMTP_PASSWORD)] if not v],
+        )
         return False
 
-    try:
-        subject = f"[GCOD3] New lead: {payload.get('name', 'Unknown')}"
-        body_lines = [
-            "A new enquiry just arrived on gcod3.com:",
-            "",
-            f"Name:     {payload.get('name', '-')}",
-            f"Email:    {payload.get('email', '-')}",
-            f"Phone:    {payload.get('phone', '-')}",
-            f"Company:  {payload.get('company', '-')}",
-            f"Subject:  {payload.get('subject', '-')}",
-            f"Source:   {payload.get('source', 'contact_form')}",
-            "",
-            "Message:",
-            payload.get('message') or payload.get('project_details') or '(no message)',
-            "",
-            "—",
-            f"Logged at {now_iso()}",
-        ]
-        msg = MIMEMultipart()
-        msg['From'] = CONTACT_FROM
-        msg['To'] = CONTACT_TO
-        msg['Reply-To'] = payload.get('email') or CONTACT_FROM
-        msg['Subject'] = subject
-        msg.attach(MIMEText("\n".join(body_lines), 'plain'))
+    subject = f"[GCOD3] New lead: {payload.get('name', 'Unknown')}"
+    body_lines = [
+        "A new enquiry just arrived on gcod3.com:",
+        "",
+        f"Name:     {payload.get('name', '-')}",
+        f"Email:    {payload.get('email', '-')}",
+        f"Phone:    {payload.get('phone', '-')}",
+        f"Company:  {payload.get('company', '-')}",
+        f"Subject:  {payload.get('subject', '-')}",
+        f"Source:   {payload.get('source', 'contact_form')}",
+        "",
+        "Message:",
+        payload.get('message') or payload.get('project_details') or '(no message)',
+        "",
+        "—",
+        f"Logged at {now_iso()}",
+    ]
+    msg = MIMEMultipart()
+    msg['From'] = CONTACT_FROM
+    msg['To'] = CONTACT_TO
+    msg['Reply-To'] = payload.get('email') or CONTACT_FROM
+    msg['Subject'] = subject
+    msg.attach(MIMEText("\n".join(body_lines), 'plain'))
 
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=12) as s:
-            s.starttls()
-            s.login(SMTP_USER, SMTP_PASSWORD)
-            s.send_message(msg)
-        logger.info("Contact email sent to %s", CONTACT_TO)
-        return True
-    except Exception as exc:
-        logger.exception("Failed to send contact email: %s", exc)
-        return False
+    # Try STARTTLS (587), then implicit SSL (465). Render's free tier
+    # sometimes blocks 587 outbound — 465 SSL usually goes through.
+    attempts = [(SMTP_PORT, 'starttls')]
+    if SMTP_PORT != 465:
+        attempts.append((465, 'ssl'))
+
+    last_err = None
+    for port, mode in attempts:
+        try:
+            if mode == 'ssl':
+                import ssl
+                ctx = ssl.create_default_context()
+                with smtplib.SMTP_SSL(SMTP_HOST, port, timeout=15, context=ctx) as s:
+                    s.login(SMTP_USER, SMTP_PASSWORD)
+                    s.send_message(msg)
+            else:
+                with smtplib.SMTP(SMTP_HOST, port, timeout=15) as s:
+                    s.ehlo()
+                    s.starttls()
+                    s.ehlo()
+                    s.login(SMTP_USER, SMTP_PASSWORD)
+                    s.send_message(msg)
+            logger.info("Contact email sent to %s via %s:%s", CONTACT_TO, SMTP_HOST, port)
+            return True
+        except Exception as exc:
+            last_err = exc
+            logger.warning("SMTP %s on port %s failed: %s", mode, port, exc)
+    logger.error("All SMTP attempts failed. Last error: %s", last_err)
+    return False
 
 # ─── Models ─────────────────────────────────────────────────────────────────
 class UserCreate(BaseModel):
@@ -798,13 +822,31 @@ async def root():
 # Include router
 app.include_router(api)
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_credentials=True,
-    allow_origins=os.environ.get('CORS_ORIGINS', '*').split(','),
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# ─── CORS ──────────────────────────────────────────────────────────────────
+_cors_raw = os.environ.get('CORS_ORIGINS', '').strip()
+if not _cors_raw or _cors_raw == '*':
+    # No explicit origins set → permissive mode for first-deploy convenience.
+    # `allow_credentials=False` is REQUIRED by the CORS spec when origin = "*",
+    # otherwise browsers reject every preflight (which silently breaks signup).
+    # Auth still works because we send JWTs via the Authorization header.
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.warning("CORS: no CORS_ORIGINS set → using permissive mode (*, credentials=off). Set CORS_ORIGINS env on Render to lock this down.")
+else:
+    origins = [o.strip() for o in _cors_raw.split(',') if o.strip()]
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+    logger.info("CORS: locked to origins: %s", origins)
 
 @app.on_event("shutdown")
 async def shutdown_db_client():
