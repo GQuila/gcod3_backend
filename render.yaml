@@ -29,6 +29,11 @@ services:
         value: https://integrations.emergentagent.com/llm
       - key: AI_MODEL
         value: claude-sonnet-4-5-20250929
+      # Native Google Sign-In (no Emergent bridge). Paste your OAuth Client ID
+      # from https://console.cloud.google.com -> APIs & Services -> Credentials.
+      # Leave unset to disable Google Sign-In.
+      - key: GOOGLE_CLIENT_ID
+        sync: false
       - key: CORS_ORIGINS
         value: "https://www.gcod3.com,https://gcod3.com"
       # ── optional: Gmail SMTP for contact-form email delivery ──

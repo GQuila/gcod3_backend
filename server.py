@@ -62,6 +62,9 @@ JWT_SECRET = _require_env(
     "Set a long random string. Generate one with: openssl rand -hex 48",
 )
 JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
+# Native Google Sign-In: paste your OAuth Client ID from Google Cloud Console.
+# Leave empty to disable Google Sign-In (the frontend hides the button too).
+GOOGLE_CLIENT_ID = os.environ.get('GOOGLE_CLIENT_ID', '').strip()
 # AI: use the official public OpenAI SDK against the Emergent universal-key
 # proxy (OpenAI-compatible). Same key (EMERGENT_LLM_KEY) routes to Claude /
 # OpenAI / Gemini behind the scenes — no private packages required, so the
@@ -331,25 +334,41 @@ async def login(payload: UserLogin, response: Response):
     response.set_cookie("session_token", token, httponly=True, secure=True, samesite="none", path="/", max_age=60*60*24*7)
     return {"token": token, "user": serialize_user(user)}
 
-@api.post("/auth/google/session")
-async def google_session(request: Request, response: Response):
-    """Exchange Emergent OAuth session_id for our user session."""
-    body = await request.json()
-    session_id = body.get("session_id")
-    if not session_id:
-        raise HTTPException(status_code=400, detail="session_id required")
-    async with httpx.AsyncClient(timeout=15) as http:
-        r = await http.get(
-            "https://demobackend.emergentagent.com/auth/v1/env/oauth/session-data",
-            headers={"X-Session-ID": session_id},
+@api.post("/auth/google")
+async def google_signin(request: Request, response: Response):
+    """Native Google Sign-In. Frontend sends a Google ID token (credential)
+    obtained from Google Identity Services (`@react-oauth/google`). We verify
+    it cryptographically against Google's public keys, then issue our own JWT.
+    Zero third-party bridges. Zero Emergent involvement.
+    """
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(
+            status_code=503,
+            detail="Google Sign-In is not configured on the server (GOOGLE_CLIENT_ID env var missing).",
         )
-    if r.status_code != 200:
-        raise HTTPException(status_code=401, detail="Invalid OAuth session")
-    data = r.json()
-    email = data["email"].lower()
-    name = data.get("name", email)
-    picture = data.get("picture")
-    session_token = data["session_token"]
+    body = await request.json()
+    credential = body.get("credential")
+    if not credential:
+        raise HTTPException(status_code=400, detail="credential (Google ID token) is required")
+
+    # Verify the ID token against Google. This checks signature, expiry,
+    # and that the audience matches OUR client_id.
+    try:
+        from google.oauth2 import id_token as google_id_token
+        from google.auth.transport import requests as google_requests
+        idinfo = google_id_token.verify_oauth2_token(
+            credential,
+            google_requests.Request(),
+            GOOGLE_CLIENT_ID,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=401, detail=f"Invalid Google token: {e}")
+
+    email = (idinfo.get("email") or "").lower()
+    if not email or not idinfo.get("email_verified"):
+        raise HTTPException(status_code=401, detail="Google account email is not verified")
+    name = idinfo.get("name") or email.split("@")[0]
+    picture = idinfo.get("picture")
 
     user = await db.users.find_one({"email": email}, {"_id": 0})
     if not user:
@@ -366,18 +385,17 @@ async def google_session(request: Request, response: Response):
         }
         await db.users.insert_one(user)
     else:
-        # update picture/name if changed
-        await db.users.update_one({"user_id": user["user_id"]}, {"$set": {"name": name, "picture": picture}})
+        await db.users.update_one(
+            {"user_id": user["user_id"]},
+            {"$set": {"name": name, "picture": picture}},
+        )
 
-    expires_at = datetime.now(timezone.utc) + timedelta(days=7)
-    await db.user_sessions.insert_one({
-        "session_token": session_token,
-        "user_id": user["user_id"],
-        "expires_at": expires_at.isoformat(),
-        "created_at": now_iso(),
-    })
-    response.set_cookie("session_token", session_token, httponly=True, secure=True, samesite="none", path="/", max_age=60*60*24*7)
-    return {"user": serialize_user(user)}
+    token = create_jwt(user["user_id"])
+    response.set_cookie(
+        "session_token", token, httponly=True, secure=True,
+        samesite="none", path="/", max_age=60 * 60 * 24 * 7,
+    )
+    return {"token": token, "user": serialize_user(user)}
 
 @api.get("/auth/me")
 async def me(user: dict = Depends(current_user)):
