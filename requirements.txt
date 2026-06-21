@@ -19,9 +19,11 @@ bcrypt==4.1.3
 pyjwt>=2.10.1
 cryptography>=42.0.8
 
-# ─── AI provider (Emergent universal key — Anthropic/OpenAI/Gemini via one key) ──
-# Installed from Emergent's public package index (see render.yaml buildCommand).
-emergentintegrations
+# ─── AI provider (official OpenAI SDK — public PyPI, works on Render) ───
+# We call the Emergent universal-key proxy which is OpenAI-compatible and
+# routes to Claude / OpenAI / Gemini under the hood. Override the base_url
+# via the AI_BASE_URL env var to talk to any other OpenAI-compatible host.
+openai>=1.50.0
 
 # ─── Misc utils ──────────────────────────────────────────────
 tzdata>=2024.2

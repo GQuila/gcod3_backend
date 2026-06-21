@@ -33,7 +33,7 @@ import bcrypt
 import jwt
 import httpx
 
-from emergentintegrations.llm.chat import LlmChat, UserMessage, TextDelta, StreamDone
+from openai import AsyncOpenAI
 
 ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
@@ -43,10 +43,18 @@ MONGO_URL = os.environ['MONGO_URL']
 DB_NAME = os.environ['DB_NAME']
 JWT_SECRET = os.environ['JWT_SECRET']
 JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
-EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY', '')
-AI_PROVIDER = os.environ.get('AI_PROVIDER', 'anthropic')
-AI_MODEL_NAME = os.environ.get('AI_MODEL', 'claude-sonnet-4-6')
-AI_ENABLED = bool(EMERGENT_LLM_KEY)
+# AI: use the official public OpenAI SDK against the Emergent universal-key
+# proxy (OpenAI-compatible). Same key (EMERGENT_LLM_KEY) routes to Claude /
+# OpenAI / Gemini behind the scenes — no private packages required, so the
+# build is clean on Render. Override AI_BASE_URL + LLM_API_KEY at any time
+# to use a direct provider (e.g. raw OpenAI or Anthropic-OpenAI gateway).
+LLM_API_KEY = os.environ.get('LLM_API_KEY', '') or os.environ.get('EMERGENT_LLM_KEY', '')
+AI_BASE_URL = os.environ.get('AI_BASE_URL', 'https://integrations.emergentagent.com/llm')
+AI_MODEL_NAME = os.environ.get('AI_MODEL', 'claude-sonnet-4-5-20250929')
+AI_ENABLED = bool(LLM_API_KEY)
+
+# Shared async client (connection pooling across requests).
+ai_client = AsyncOpenAI(api_key=LLM_API_KEY, base_url=AI_BASE_URL) if AI_ENABLED else None
 
 # SMTP / Contact email — optional, gracefully degrades if not configured
 SMTP_HOST = os.environ.get('SMTP_HOST', '')
@@ -424,41 +432,38 @@ async def ai_chat_stream(payload: ChatRequest):
         import json as _json
         # send session_id first
         yield f"data: {_json.dumps({'session_id': sid})}\n\n"
-        if not AI_ENABLED:
+        if not ai_client:
             yield f"data: {_json.dumps({'error': 'AI is not configured on the server.'})}\n\n"
             yield "data: [DONE]\n\n"
             return
 
-        # Load prior conversation for this session (multi-turn memory)
+        # Load prior conversation (multi-turn memory). OpenAI-compatible API:
+        # system + alternating user/assistant turns. We already inserted the
+        # current user message above, so it's the last item.
         history_docs = await db.ai_messages.find(
             {"session_id": sid},
             {"_id": 0, "role": 1, "content": 1, "created_at": 1},
         ).sort("created_at", 1).to_list(40)
-        # Build a brief prior-conversation context (we'll send the current message via UserMessage)
-        prior = [m for m in history_docs if m["content"] != payload.message][-20:]
-        context_block = ""
-        if prior:
-            lines = []
-            for m in prior:
-                tag = "User" if m["role"] == "user" else "G-Bot"
-                lines.append(f"{tag}: {m['content']}")
-            context_block = "\n\nPrior conversation:\n" + "\n".join(lines) + "\n"
+        messages = [{"role": "system", "content": GCOD3_SYSTEM_PROMPT}]
+        for m in history_docs:
+            messages.append({"role": m["role"], "content": m["content"]})
 
         full_text = ""
         try:
-            chat = LlmChat(
-                api_key=EMERGENT_LLM_KEY,
-                session_id=sid,
-                system_message=GCOD3_SYSTEM_PROMPT + context_block,
-            ).with_model(AI_PROVIDER, AI_MODEL_NAME)
-            async for event in chat.stream_message(UserMessage(text=payload.message)):
-                if isinstance(event, TextDelta):
-                    if not event.content:
-                        continue
-                    full_text += event.content
-                    yield f"data: {_json.dumps({'delta': event.content})}\n\n"
-                elif isinstance(event, StreamDone):
-                    break
+            stream = await ai_client.chat.completions.create(
+                model=AI_MODEL_NAME,
+                messages=messages,
+                max_tokens=1024,
+                stream=True,
+            )
+            async for chunk in stream:
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta.content or ""
+                if not delta:
+                    continue
+                full_text += delta
+                yield f"data: {_json.dumps({'delta': delta})}\n\n"
         except Exception as e:
             logger.exception("AI stream failed")
             yield f"data: {_json.dumps({'error': str(e)[:160]})}\n\n"
@@ -488,23 +493,27 @@ async def ai_tool(payload: AIToolRequest, user: dict = Depends(current_user)):
         "code": "You are a senior software engineer. Provide clean, production-quality code with brief explanation. Output in Markdown with code blocks.",
         "website_content": "You are an elite website copywriter. Generate full sections: Hero headline + sub, 3 feature bullets, CTA. Use Markdown.",
     }
-    if not AI_ENABLED:
+    if not ai_client:
         raise HTTPException(status_code=503, detail="AI is not configured on the server.")
     system = sys_map.get(payload.tool, sys_map["content_writer"])
     full_prompt = f"Tone: {payload.tone}.\n\nTask: {payload.prompt}"
     output = ""
     try:
-        chat = LlmChat(
-            api_key=EMERGENT_LLM_KEY,
-            session_id=f"tool_{uuid.uuid4().hex[:12]}",
-            system_message=system,
-        ).with_model(AI_PROVIDER, AI_MODEL_NAME)
-        async for event in chat.stream_message(UserMessage(text=full_prompt)):
-            if isinstance(event, TextDelta):
-                if event.content:
-                    output += event.content
-            elif isinstance(event, StreamDone):
-                break
+        stream = await ai_client.chat.completions.create(
+            model=AI_MODEL_NAME,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": full_prompt},
+            ],
+            max_tokens=2048,
+            stream=True,
+        )
+        async for chunk in stream:
+            if not chunk.choices:
+                continue
+            delta = chunk.choices[0].delta.content or ""
+            if delta:
+                output += delta
     except Exception as e:
         logger.exception("AI tool failed")
         raise HTTPException(status_code=500, detail=str(e))

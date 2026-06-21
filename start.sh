@@ -2,6 +2,6 @@
 # Usage:  bash start.sh
 set -e
 echo ">> Installing backend dependencies"
-pip install -r requirements.txt --extra-index-url https://d33sy5i8bnduwe.cloudfront.net/simple/
+pip install -r requirements.txt
 echo ">> Starting FastAPI (http://localhost:8001)"
 uvicorn server:app --host 0.0.0.0 --port 8001 --reload
