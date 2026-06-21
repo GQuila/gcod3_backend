@@ -39,9 +39,28 @@ ROOT_DIR = Path(__file__).parent
 load_dotenv(ROOT_DIR / '.env')
 
 # ─── Configuration ──────────────────────────────────────────────────────────
-MONGO_URL = os.environ['MONGO_URL']
-DB_NAME = os.environ['DB_NAME']
-JWT_SECRET = os.environ['JWT_SECRET']
+def _require_env(name: str, hint: str) -> str:
+    """Fail fast with a human-readable message if a required env var is missing.
+    Render / Hostinger / any host will surface this in the logs instead of a
+    cryptic KeyError stack trace."""
+    val = os.environ.get(name, '').strip()
+    if not val:
+        raise RuntimeError(
+            f"\n\n[GCOD3 startup] Missing required environment variable: {name}\n"
+            f"  -> {hint}\n"
+            f"  On Render: dashboard -> your service -> Environment -> Add Environment Variable.\n"
+        )
+    return val
+
+MONGO_URL = _require_env(
+    'MONGO_URL',
+    "Set your MongoDB Atlas connection string (mongodb+srv://user:pass@cluster.../...).",
+)
+DB_NAME = os.environ.get('DB_NAME', 'gcod3_production')
+JWT_SECRET = _require_env(
+    'JWT_SECRET',
+    "Set a long random string. Generate one with: openssl rand -hex 48",
+)
 JWT_ALGO = os.environ.get('JWT_ALGO', 'HS256')
 # AI: use the official public OpenAI SDK against the Emergent universal-key
 # proxy (OpenAI-compatible). Same key (EMERGENT_LLM_KEY) routes to Claude /
